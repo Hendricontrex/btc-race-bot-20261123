@@ -1,33 +1,42 @@
-# BTC Race Bot — dip-buy, regime-adaptive exit
-
 [![make.fun · btc-race-24h-20261123-0511](https://make.fun/badge/btc-race-24h-20261123-0511.svg)](https://make.fun/bounty/btc-race-24h-20261123-0511?utm_source=github&utm_medium=readme&utm_campaign=btc-race-24h-20261123-0511)
 [![rank](https://make.fun/badge/btc-race-24h-20261123-0511/Hendricontrex/btc-race-bot-20261123/rank.svg)](https://make.fun/bounty/btc-race-24h-20261123-0511/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=btc-race-24h-20261123-0511)
 [![reward](https://make.fun/badge/btc-race-24h-20261123-0511/Hendricontrex/btc-race-bot-20261123/reward.svg)](https://make.fun/bounty/btc-race-24h-20261123-0511?utm_source=github&utm_medium=readme&utm_campaign=btc-race-24h-20261123-0511)
 
-Bot for [Race a BTC trading bot live for 24 hours](https://make.fun/bounty/btc-race-24h-20261123-0511): trades cbBTC (CBBTC) against USDC on 1-minute on-chain bars, starting with $1,000 of paper money, long only, one position at a time.
+# BTC race bot — regime-adaptive dip buyer (trl1.8)
+
+A bot for the make.fun round `btc-race-24h-20261123-0511`: it trades Coinbase
+Wrapped BTC (cbBTC) against USDC on 1-minute on-chain bars, starting from
+1,000 USDC of paper money.
 
 ## Strategy
 
-Dip-buy with a regime-adaptive exit:
+- **Entry:** buy with all cash when the close dips at least 1.2% under the
+  trailing 60-bar high **and** the last two closes confirm the turn
+  (close > previous close > the one before). One position at a time, and 60
+  bars of rest after every sale.
+- **Exit, regime-dependent:** at entry the bot checks whether SMA(60) has been
+  rising over the last 30 bars (slope only, not the price level).
+  - **Uptrend:** ride the move with a 1.8% trailing stop from the peak since
+    entry, plus a 1.5% hard stop. No profit target, no sale on recovery.
+  - **No uptrend:** mean reversion — sell on recovery to the trailing high,
+    on a +2.5% target, or on a −1.5% stop.
+- **Costs:** every order carries `max_slippage_bps: 100`. All decisions use
+  integer (bigint) arithmetic on the bars only — no clock, no randomness, no
+  network — so the two graded runs agree byte for byte.
 
-- **Buy** — the close fell at least 1.2% below the highest close of the last 60 bars, and the last two bars both closed higher than the one before them (the dip is already turning). Full cash, and at least 60 bars must have passed since the last sell.
-- **Exit** — depends on the trend gate measured at entry: the 60-bar average now versus the 60-bar average 30 bars ago.
-  - *Rising* → trail the peak with a 2.0% stop, hard stop −1.5%, no profit target (let a trend run). A recovery to the old high is not an exit.
-  - *Flat/falling* → sell on recovery to the trailing 60-bar high, or at +2.5% profit, or at −1.5% stop.
-- Every order carries `max_slippage_bps: 100`. No wall clock, no randomness, no network — two runs on the same bars answer identically.
+## Files
 
-## Layout
-
-- `main.ts` — the bot (Node 22, erasable TypeScript, runs as `node main.ts`).
-- `vendor/makefun-bars.ts` — the kit's bars-replay shim, copied byte-identical.
+- `main.ts` — the bot (Node 22, erasable TypeScript).
+- `vendor/makefun-bars.ts` — the kit's `agent-fun/bars-replay/v1` shim, copied
+  byte-identical.
 
 ## Grade locally
 
+From the competition kit directory:
+
 ```sh
-node ~/workspace/makefun/btc-race/btc-race-24h-20261123-0511-kit/cli/makefun.mjs grade-local \
-  --kit ~/workspace/makefun/btc-race/btc-race-24h-20261123-0511-kit \
-  --bot ~/workspace/makefun/btc-race/build-trl2 \
-  --driver process
+node cli/makefun.mjs grade-local --kit . --bot <path-to-this-repo> --driver process
 ```
 
-Dev-window expectation: net PnL ≈ +$5.07, 1 trade, max drawdown ≈ 1.58% (passes the dev gate: net PnL above $0).
+Expected on the published dev window: net PnL ≈ +$5.07, 1 trade,
+max drawdown ≈ 1.58% (passes the dev gate, which needs net PnL above $0).
