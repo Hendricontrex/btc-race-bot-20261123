@@ -1,159 +1,138 @@
-// Regime-adaptive dip buyer for the make.fun BTC race, round btc-race-24h-20261123-0511.
+// Dip-buy mean-reversion bot for the BTC race (v3 fallback).
 //
-// The idea, in one paragraph: BTC spends most minutes drifting sideways, then
-// snaps back after a short dip. This bot waits for a dip of at least 1.2% under
-// the trailing 60-bar high, confirms the turn with two rising closes, and buys
-// with all its cash. How it gets out depends on the regime at entry: when the
-// 60-bar average has been climbing for the last 30 bars the dip is treated as a
-// pullback inside an uptrend, so the bot rides it with a 1.8% trailing stop and
-// no profit target; when the average is flat or falling the dip is treated as a
-// mean-reversion setup, so the bot sells on recovery to the trailing high, on a
-// 2.5% gain, or on a 1.5% loss. One position at a time, 60 bars of rest after
-// every sale, and nothing but the bars themselves decides anything.
+// Idea: cbBTC wobbles around a slow drift, so buy a dip off its recent high
+// and sell the recovery. Long only, at most one open position, full cash per
+// buy, fully deterministic — no clock, no randomness, no network.
 //
-// All arithmetic is integer (bigint) so the two graded runs agree byte for
-// byte: no clock, no randomness, no network, no files.
+// Entry (while flat):
+//   - trailing high = highest close of the last 60 bars (current bar included)
+//   - the close sits at least 1.2% below that high, and
+//   - the last two closes are rising (close > prev > prev-prev), and
+//   - at least 60 bars have passed since the last sell.
+// Exit (while holding):
+//   - the close recovers to the trailing high, or
+//   - the close is 2.5% above the entry close, or
+//   - the close is 1.5% below the entry close.
+// Every order caps its allowed move from the latest close at 100 bps.
 
 import { runBars } from './vendor/makefun-bars.ts';
+import type { BarsState, Batch, OrderInput } from './vendor/makefun-bars.ts';
 
-const SYMBOL = 'CBBTC';
+const ASSET = 'CBBTC';
 
-// Knobs, all in bars or basis points (1 bp = 0.01%).
-const WINDOW = 60; // trailing-high window and SMA length, in bars
-const DIP_BPS = 120; // buy when close is this far under the trailing high
-const REST_BARS = 60; // bars to wait after a sale before the next buy
-const SLOPE_BARS = 30; // SMA(60) now vs SMA(60) this many bars ago
-const REVERT_TARGET_BPS = 250; // mean-reversion exit: +2.5% from entry
-const STOP_BPS = 150; // exit on a 1.5% loss from entry, either regime
-const TRAIL_BPS = 180; // trend exit: 1.8% trailing stop from the peak
-const SLIPPAGE_BPS = 100; // max_slippage_bps on every order
+// How far back the trailing high looks, and how many closes are kept.
+const HIGH_BARS = 60;
+const KEPT_BARS = 90;
 
-const BPS_DENOM = 10_000n;
+// Dip: buy when close * 1000 <= high * 988 (1.2% under the high).
+const DIP_NUM = 988n;
+const DIP_DEN = 1000n;
 
-// price * (1 - bps / 10000), truncated toward zero.
-function belowBy(price: bigint, bps: number): bigint {
-  return (price * (BPS_DENOM - BigInt(bps))) / BPS_DENOM;
-}
+// Target: sell when close * 1000 >= entry * 1025 (+2.5% over entry).
+const WIN_NUM = 1025n;
+const WIN_DEN = 1000n;
 
-// price * (1 + bps / 10000), truncated toward zero.
-function aboveBy(price: bigint, bps: number): bigint {
-  return (price * (BPS_DENOM + BigInt(bps))) / BPS_DENOM;
-}
+// Stop: sell when close * 1000 <= entry * 985 (-1.5% under entry).
+const LOSE_NUM = 985n;
+const LOSE_DEN = 1000n;
 
-// Largest close among the last `n` entries of `closes` (all of them when fewer).
-function trailingHigh(closes: bigint[], n: number): bigint {
-  let high = 0n;
-  const start = Math.max(0, closes.length - n);
-  for (let i = start; i < closes.length; i++) {
-    if (closes[i]! > high) high = closes[i]!;
-  }
-  return high;
-}
+// Max move an order tolerates from the latest close, in basis points.
+const SLIPPAGE_BPS = 100;
 
-// Sum of the last `n` closes, or null when fewer than `n` are known.
-function trailingSum(closes: bigint[], n: number): bigint | null {
-  if (closes.length < n) return null;
-  let sum = 0n;
-  for (let i = closes.length - n; i < closes.length; i++) sum += closes[i]!;
-  return sum;
-}
+// Bars to rest after a sell before the next buy may fire.
+const REST_BARS = 60;
 
-// Is the 60-bar average rising? Compares the sum of the last 60 closes with
-// the sum of the 60 closes ending 30 bars ago (same length, so the sums
-// compare directly and no division is needed). Needs 90 closes to answer.
-function trendIsUp(closes: bigint[]): boolean {
-  const now = trailingSum(closes, WINDOW);
-  if (now === null || closes.length < WINDOW + SLOPE_BARS) return false;
-  let then = 0n;
-  for (let i = closes.length - WINDOW - SLOPE_BARS; i < closes.length - SLOPE_BARS; i++) {
-    then += closes[i]!;
-  }
-  return now > then;
-}
+class DipBuyer {
+  // Recent closes, oldest first; capped at KEPT_BARS entries.
+  private closes: bigint[] = [];
+  // Bars actually seen (non-warm-up batches that carried a CBBTC close).
+  private seen = 0;
+  // Close the current position was entered at; null while flat.
+  private enteredAt: bigint | null = null;
+  // `seen` count of the bar the last sell was decided on.
+  private lastExit = -1_000_000_000;
 
-// One open trade, remembered from the bar its buy was decided on.
-interface OpenTrade {
-  trendRide: boolean; // true: trend exit rules; false: mean-reversion exit rules
-  entryClose: bigint; // close on the bar the buy was decided
-  peakClose: bigint; // highest close seen since the entry
-}
-
-const closes: bigint[] = [];
-let openTrade: OpenTrade | null = null;
-let awaitingBuy: { trendRide: boolean; entryClose: bigint; clientId: string } | null = null;
-let lastSaleSeq = -10_000;
-
-await runBars({
-  onBatch(state, batch) {
-    // A buy we sent last bar: if the harness refused it, drop the pending
-    // entry so a later dip can try again instead of waiting forever.
-    if (awaitingBuy !== null) {
-      for (const fill of batch.fills) {
-        if (fill.client_id === awaitingBuy.clientId && fill.status === 'rejected') {
-          awaitingBuy = null;
-        }
-      }
+  private trailingHigh(): bigint {
+    let top = 0n;
+    for (let i = this.closes.length - HIGH_BARS; i < this.closes.length; i += 1) {
+      const c = this.closes[i] as bigint;
+      if (c > top) top = c;
     }
+    return top;
+  }
 
-    const bar = batch.bars.find((b) => b.symbol === SYMBOL);
-    if (bar !== undefined) closes.push(BigInt(bar.c));
-    const close = closes.length > 0 ? closes[closes.length - 1]! : null;
+  // Uptick-2 confirm: the last two closes must both be rising, so a buy
+  // fires only once the dip has started to turn instead of mid-fall.
+  private confirmRising(): boolean {
+    const n = this.closes.length;
+    const latest = this.closes[n - 1] as bigint;
+    const previous = this.closes[n - 2] as bigint;
+    const beforeThat = this.closes[n - 3] as bigint;
+    return latest > previous && previous > beforeThat;
+  }
 
-    const held = state.positions.get(SYMBOL);
-    const holding = held !== undefined && held.qty > 0n;
+  // Exit check, kept separate so the three sell rules stay readable:
+  // recovery to the trailing high, +2.5% target, or -1.5% stop.
+  private shouldExit(close: bigint, high: bigint, entry: bigint): boolean {
+    const recovered = close >= high;
+    const hitTarget = close * WIN_DEN >= entry * WIN_NUM;
+    const hitStop = close * LOSE_DEN <= entry * LOSE_NUM;
+    return recovered || hitTarget || hitStop;
+  }
 
-    // The position showed up after our buy filled: anchor the trade on it.
-    if (holding && openTrade === null && close !== null) {
-      const anchored = awaitingBuy ?? { trendRide: trendIsUp(closes), entryClose: close };
-      openTrade = {
-        trendRide: anchored.trendRide,
-        entryClose: anchored.entryClose,
-        peakClose: anchored.entryClose > close ? anchored.entryClose : close,
-      };
-      awaitingBuy = null;
-    }
+  decide(state: BarsState): OrderInput[] {
+    // Orders decided during warm-up are rejected, so stay quiet there.
+    if (state.warmingUp) return [];
+    const close = state.close(ASSET);
+    // A minute with no CBBTC bar carries no signal and counts as no bar.
+    if (close === null) return [];
 
-    if (state.warmingUp || close === null) return [];
+    this.seen += 1;
+    this.closes.push(close);
+    if (this.closes.length > KEPT_BARS) this.closes.shift();
+    // Need a full lookback before the high (or the confirm) means anything.
+    if (this.closes.length < HIGH_BARS) return [];
 
-    // --- Holding: decide whether to sell. ---
-    if (holding && openTrade !== null) {
-      if (close > openTrade.peakClose) openTrade.peakClose = close;
-      const high = trailingHigh(closes, WINDOW);
-      let sell = false;
-      if (openTrade.trendRide) {
-        // Ride the uptrend: out on the trailing stop or the hard stop only.
-        sell = close <= belowBy(openTrade.peakClose, TRAIL_BPS) || close <= belowBy(openTrade.entryClose, STOP_BPS);
-      } else {
-        // Mean reversion: out on recovery to the high, the target, or the stop.
-        sell =
-          close >= high || close >= aboveBy(openTrade.entryClose, REVERT_TARGET_BPS) || close <= belowBy(openTrade.entryClose, STOP_BPS);
-      }
-      if (sell) {
-        const qty = state.positions.get(SYMBOL)!.qty;
-        lastSaleSeq = state.seq;
-        openTrade = null;
-        return [{ side: 'sell', symbol: SYMBOL, qty, max_slippage_bps: SLIPPAGE_BPS }];
+    const high = this.trailingHigh();
+    const holding = (state.positions.get(ASSET)?.qty ?? 0n) > 0n;
+
+    if (!holding) {
+      const dipped = close * DIP_DEN <= high * DIP_NUM;
+      const rested = this.seen - this.lastExit >= REST_BARS;
+      if (dipped && rested && this.confirmRising() && state.cash > 0n) {
+        this.enteredAt = close;
+        return [
+          {
+            side: 'buy',
+            symbol: ASSET,
+            notional_quote_units: state.cash,
+            max_slippage_bps: SLIPPAGE_BPS,
+          },
+        ];
       }
       return [];
     }
 
-    // --- Flat: decide whether to buy. ---
-    if (holding || awaitingBuy !== null) return [];
-    if (closes.length < WINDOW) return [];
-    if (state.seq - lastSaleSeq < REST_BARS) return [];
-    if (state.cash <= 0n) return [];
+    const entry = this.enteredAt ?? close;
+    if (this.shouldExit(close, high, entry)) {
+      const qty = (state.positions.get(ASSET) as { qty: bigint }).qty;
+      this.enteredAt = null;
+      this.lastExit = this.seen;
+      return [
+        {
+          side: 'sell',
+          symbol: ASSET,
+          qty,
+          max_slippage_bps: SLIPPAGE_BPS,
+        },
+      ];
+    }
+    return [];
+  }
+}
 
-    const high = trailingHigh(closes, WINDOW);
-    const prev = closes[closes.length - 2]!;
-    const prevPrev = closes[closes.length - 3]!;
-    // Two rising closes confirm the turn; the dip itself is the trigger.
-    const turningUp = close > prev && prev > prevPrev;
-    const dipped = close <= belowBy(high, DIP_BPS);
-    if (!turningUp || !dipped) return [];
+const buyer = new DipBuyer();
 
-    const trendRide = trendIsUp(closes);
-    const clientId = state.clientId();
-    awaitingBuy = { trendRide, entryClose: close, clientId };
-    return [{ side: 'buy', symbol: SYMBOL, notional_quote_units: state.cash, max_slippage_bps: SLIPPAGE_BPS, client_id: clientId }];
-  },
+await runBars({
+  onBatch: (state: BarsState, _batch: Batch): OrderInput[] => buyer.decide(state),
 });
